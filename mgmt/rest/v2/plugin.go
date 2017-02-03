@@ -2,7 +2,7 @@
 http://www.apache.org/licenses/LICENSE-2.0.txt
 
 
-Copyright 2015 Intel Corporation
+Copyright 2017 Intel Corporation
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package rest
+package v2
 
 import (
 	"compress/gzip"
@@ -30,26 +30,46 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 
-	log "github.com/Sirupsen/logrus"
-	"github.com/julienschmidt/httprouter"
+	"path"
+	"runtime"
 
+	log "github.com/Sirupsen/logrus"
+	"github.com/intelsdi-x/snap/control"
 	"github.com/intelsdi-x/snap/core"
 	"github.com/intelsdi-x/snap/core/serror"
-	"github.com/intelsdi-x/snap/mgmt/rest/rbody"
+	"github.com/julienschmidt/httprouter"
 )
 
-const PluginAlreadyLoaded = "plugin is already loaded"
+type PluginsResponse struct {
+	RunningPlugins []RunningPlugin `json:"running_plugins,omitempty"`
+	Plugins        []Plugin        `json:"plugins,omitempty"`
+}
 
-var (
-	ErrMissingPluginName = errors.New("missing plugin name")
-	ErrPluginNotFound    = errors.New("plugin not found")
-)
+type Plugin struct {
+	Name            string        `json:"name"`
+	Version         int           `json:"version"`
+	Type            string        `json:"type"`
+	Signed          bool          `json:"signed"`
+	Status          string        `json:"status"`
+	LoadedTimestamp int64         `json:"loaded_timestamp"`
+	Href            string        `json:"href"`
+	ConfigPolicy    []PolicyTable `json:"policy,omitempty"`
+}
+
+type RunningPlugin struct {
+	Name             string `json:"name"`
+	Version          int    `json:"version"`
+	Type             string `json:"type"`
+	HitCount         int    `json:"hitcount"`
+	LastHitTimestamp int64  `json:"last_hit_timestamp"`
+	ID               uint32 `json:"id"`
+	Href             string `json:"href"`
+	PprofPort        string `json:"pprof_port"`
+}
 
 type plugin struct {
 	name       string
@@ -69,18 +89,16 @@ func (p *plugin) TypeName() string {
 	return p.pluginType
 }
 
-func (s *Server) loadPlugin(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+func (s *apiV2) loadPlugin(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil {
-		respond(500, rbody.FromError(err), w)
+		Write(415, FromError(err), w)
 		return
 	}
 	if strings.HasPrefix(mediaType, "multipart/") {
 		var pluginPath string
 		var signature []byte
 		var checkSum [sha256.Size]byte
-		lp := &rbody.PluginsLoaded{}
-		lp.LoadedPlugins = make([]rbody.LoadedPlugin, 0)
 		mr := multipart.NewReader(r.Body, params["boundary"])
 		var i int
 		for {
@@ -90,25 +108,25 @@ func (s *Server) loadPlugin(w http.ResponseWriter, r *http.Request, _ httprouter
 				break
 			}
 			if err != nil {
-				respond(500, rbody.FromError(err), w)
+				Write(500, FromError(err), w)
 				return
 			}
 			if r.Header.Get("Plugin-Compression") == "gzip" {
 				g, err := gzip.NewReader(p)
 				defer g.Close()
 				if err != nil {
-					respond(500, rbody.FromError(err), w)
+					Write(500, FromError(err), w)
 					return
 				}
 				b, err = ioutil.ReadAll(g)
 				if err != nil {
-					respond(500, rbody.FromError(err), w)
+					Write(500, FromError(err), w)
 					return
 				}
 			} else {
 				b, err = ioutil.ReadAll(p)
 				if err != nil {
-					respond(500, rbody.FromError(err), w)
+					Write(500, FromError(err), w)
 					return
 				}
 			}
@@ -125,11 +143,11 @@ func (s *Server) loadPlugin(w http.ResponseWriter, r *http.Request, _ httprouter
 			case i == 0:
 				if filepath.Ext(p.FileName()) == ".asc" {
 					e := errors.New("Error: first file passed to load plugin api can not be signature file")
-					respond(500, rbody.FromError(e), w)
+					Write(400, FromError(e), w)
 					return
 				}
 				if pluginPath, err = writeFile(p.FileName(), b); err != nil {
-					respond(500, rbody.FromError(err), w)
+					Write(500, FromError(err), w)
 					return
 				}
 				checkSum = sha256.Sum256(b)
@@ -138,19 +156,19 @@ func (s *Server) loadPlugin(w http.ResponseWriter, r *http.Request, _ httprouter
 					signature = b
 				} else {
 					e := errors.New("Error: second file passed was not a signature file")
-					respond(500, rbody.FromError(e), w)
+					Write(400, FromError(e), w)
 					return
 				}
 			case i == 2:
 				e := errors.New("Error: More than two files passed to the load plugin api")
-				respond(500, rbody.FromError(e), w)
+				Write(400, FromError(e), w)
 				return
 			}
 			i++
 		}
 		rp, err := core.NewRequestedPlugin(pluginPath)
 		if err != nil {
-			respond(500, rbody.FromError(err), w)
+			Write(500, FromError(err), w)
 			return
 		}
 		rp.SetAutoLoaded(false)
@@ -158,12 +176,12 @@ func (s *Server) loadPlugin(w http.ResponseWriter, r *http.Request, _ httprouter
 		// as after it is written to disk.
 		if rp.CheckSum() != checkSum {
 			e := errors.New("Error: CheckSum mismatch on requested plugin to load")
-			respond(500, rbody.FromError(e), w)
+			Write(400, FromError(e), w)
 			return
 		}
 		rp.SetSignature(signature)
 		restLogger.Info("Loading plugin: ", rp.Path())
-		pl, err := s.mm.Load(rp)
+		pl, err := s.metricManager.Load(rp)
 		if err != nil {
 			var ec int
 			restLogger.Error(err)
@@ -172,18 +190,17 @@ func (s *Server) loadPlugin(w http.ResponseWriter, r *http.Request, _ httprouter
 			if err2 != nil {
 				restLogger.Error(err2)
 			}
-			rb := rbody.FromError(err)
-			switch rb.ResponseBodyMessage() {
-			case PluginAlreadyLoaded:
+			rb := FromError(err)
+			switch rb.ErrorMessage {
+			case ErrPluginAlreadyLoaded:
 				ec = 409
 			default:
 				ec = 500
 			}
-			respond(ec, rb, w)
+			Write(ec, rb, w)
 			return
 		}
-		lp.LoadedPlugins = append(lp.LoadedPlugins, *catalogedPluginToLoaded(r.Host, pl))
-		respond(201, lp, w)
+		Write(201, catalogedPluginBody(r.Host, pl), w)
 	}
 }
 
@@ -197,6 +214,9 @@ func writeFile(filename string, b []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Close before load
+	defer f.Close()
+
 	n, err := f.Write(b)
 	log.Debugf("wrote %v to %v", n, f.Name())
 	if err != nil {
@@ -208,137 +228,115 @@ func writeFile(filename string, b []byte) (string, error) {
 			return "", err
 		}
 	}
-	// Close before load
-	f.Close()
 	return f.Name(), nil
 }
 
-func (s *Server) unloadPlugin(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
+func pluginParameters(p httprouter.Params) (string, string, int, map[string]interface{}, serror.SnapError) {
 	plName := p.ByName("name")
 	plType := p.ByName("type")
-	plVersion, iErr := strconv.ParseInt(p.ByName("version"), 10, 0)
+	plVersion, err := strconv.ParseInt(p.ByName("version"), 10, 0)
 	f := map[string]interface{}{
 		"plugin-name":    plName,
 		"plugin-version": plVersion,
 		"plugin-type":    plType,
 	}
 
-	if iErr != nil {
-		se := serror.New(errors.New("invalid version"))
+	if err != nil || plName == "" || plType == "" {
+		se := serror.New(errors.New("missing or invalid parameter(s)"))
 		se.SetFields(f)
-		respond(400, rbody.FromSnapError(se), w)
+		return "", "", 0, nil, se
+	}
+	return plType, plName, int(plVersion), f, nil
+}
+
+func (s *apiV2) unloadPlugin(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
+	plType, plName, plVersion, f, se := pluginParameters(p)
+	if se != nil {
+		Write(400, FromSnapError(se), w)
 		return
 	}
 
-	if plName == "" {
-		se := serror.New(errors.New("missing plugin name"))
-		se.SetFields(f)
-		respond(400, rbody.FromSnapError(se), w)
-		return
-	}
-	if plType == "" {
-		se := serror.New(errors.New("missing plugin type"))
-		se.SetFields(f)
-		respond(400, rbody.FromSnapError(se), w)
-		return
-	}
-	up, se := s.mm.Unload(&plugin{
+	_, se = s.metricManager.Unload(&plugin{
 		name:       plName,
-		version:    int(plVersion),
+		version:    plVersion,
 		pluginType: plType,
 	})
+
+	// 404 - plugin not found
+	// 409 - plugin state is not plugin loaded
+	// 500 - removing plugin from /tmp failed
 	if se != nil {
 		se.SetFields(f)
-		respond(500, rbody.FromSnapError(se), w)
+		statusCode := 500
+		switch se.Error() {
+		case control.ErrPluginNotFound.Error():
+			statusCode = 404
+		case control.ErrPluginNotInLoadedState.Error():
+			statusCode = 409
+		}
+		Write(statusCode, FromSnapError(se), w)
 		return
 	}
-	pr := &rbody.PluginUnloaded{
-		Name:    up.Name(),
-		Version: up.Version(),
-		Type:    up.TypeName(),
-	}
-	respond(200, pr, w)
+	Write(204, nil, w)
 }
 
-func (s *Server) getPlugins(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
-	var detail bool
-	for k := range r.URL.Query() {
-		if k == "details" {
-			detail = true
+func (s *apiV2) getPlugins(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+
+	// filter by plugin name or plugin type
+	q := r.URL.Query()
+	plName := q.Get("name")
+	plType := q.Get("type")
+	nbFilter := Btoi(plName != "") + Btoi(plType != "")
+
+	if _, detail := r.URL.Query()["running"]; detail {
+		// get running plugins
+		plugins := runningPluginsBody(r.Host, s.metricManager.AvailablePlugins())
+		filteredPlugins := []RunningPlugin{}
+		if nbFilter > 0 {
+			for _, p := range plugins {
+				if nbFilter == 1 && (p.Name == plName || p.Type == plType) || nbFilter == 2 && (p.Name == plName && p.Type == plType) {
+					filteredPlugins = append(filteredPlugins, p)
+				}
+			}
+		} else {
+			filteredPlugins = plugins
 		}
+		Write(200, PluginsResponse{RunningPlugins: filteredPlugins}, w)
+	} else {
+		// get plugins from the plugin catalog
+		plugins := pluginCatalogBody(r.Host, s.metricManager.PluginCatalog())
+		filteredPlugins := []Plugin{}
+
+		if nbFilter > 0 {
+			for _, p := range plugins {
+				if nbFilter == 1 && (p.Name == plName || p.Type == plType) || nbFilter == 2 && (p.Name == plName && p.Type == plType) {
+					filteredPlugins = append(filteredPlugins, p)
+				}
+			}
+		} else {
+			filteredPlugins = plugins
+		}
+		Write(200, PluginsResponse{Plugins: filteredPlugins}, w)
 	}
-	plName := params.ByName("name")
-	plType := params.ByName("type")
-	respond(200, getPlugins(s.mm, detail, r.Host, plName, plType), w)
 }
 
-func getPlugins(mm managesMetrics, detail bool, h string, plName string, plType string) *rbody.PluginList {
-
-	plCatalog := mm.PluginCatalog()
-
-	plugins := rbody.PluginList{}
-
-	plugins.LoadedPlugins = make([]rbody.LoadedPlugin, len(plCatalog))
-	for i, p := range plCatalog {
-		plugins.LoadedPlugins[i] = *catalogedPluginToLoaded(h, p)
+func Btoi(b bool) int {
+	if b {
+		return 1
 	}
-
-	if detail {
-		aPlugins := mm.AvailablePlugins()
-		plugins.AvailablePlugins = make([]rbody.AvailablePlugin, len(aPlugins))
-		for i, p := range aPlugins {
-			plugins.AvailablePlugins[i] = rbody.AvailablePlugin{
-				Name:             p.Name(),
-				Version:          p.Version(),
-				Type:             p.TypeName(),
-				HitCount:         p.HitCount(),
-				LastHitTimestamp: p.LastHit().Unix(),
-				ID:               p.ID(),
-				Href:             pluginURI(h, p),
-				PprofPort:        p.Port(),
-			}
-		}
-	}
-
-	filteredPlugins := rbody.PluginList{}
-
-	if plName != "" {
-		for _, p := range plugins.LoadedPlugins {
-			if p.Name == plName {
-				filteredPlugins.LoadedPlugins = append(filteredPlugins.LoadedPlugins, p)
-			}
-		}
-		for _, p := range plugins.AvailablePlugins {
-			if p.Name == plName {
-				filteredPlugins.AvailablePlugins = append(filteredPlugins.AvailablePlugins, p)
-			}
-		}
-		// update plugins so that further filters consider previous filters
-		plugins = filteredPlugins
-	}
-
-	filteredPlugins = rbody.PluginList{}
-
-	if plType != "" {
-		for _, p := range plugins.LoadedPlugins {
-			if p.Type == plType {
-				filteredPlugins.LoadedPlugins = append(filteredPlugins.LoadedPlugins, p)
-			}
-		}
-		for _, p := range plugins.AvailablePlugins {
-			if p.Type == plType {
-				filteredPlugins.AvailablePlugins = append(filteredPlugins.AvailablePlugins, p)
-			}
-		}
-		// filter based on type
-		plugins = filteredPlugins
-	}
-
-	return &plugins
+	return 0
 }
 
-func catalogedPluginToLoaded(host string, c core.CatalogedPlugin) *rbody.LoadedPlugin {
-	return &rbody.LoadedPlugin{
+func pluginCatalogBody(host string, c []core.CatalogedPlugin) []Plugin {
+	plugins := make([]Plugin, len(c))
+	for i, p := range c {
+		plugins[i] = catalogedPluginBody(host, p)
+	}
+	return plugins
+}
+
+func catalogedPluginBody(host string, c core.CatalogedPlugin) Plugin {
+	return Plugin{
 		Name:            c.Name(),
 		Version:         c.Version(),
 		Type:            c.TypeName(),
@@ -349,37 +347,35 @@ func catalogedPluginToLoaded(host string, c core.CatalogedPlugin) *rbody.LoadedP
 	}
 }
 
-func (s *Server) getPlugin(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
-	plName := p.ByName("name")
-	plType := p.ByName("type")
-	plVersion, iErr := strconv.ParseInt(p.ByName("version"), 10, 0)
-	f := map[string]interface{}{
-		"plugin-name":    plName,
-		"plugin-version": plVersion,
-		"plugin-type":    plType,
+func runningPluginsBody(host string, c []core.AvailablePlugin) []RunningPlugin {
+	plugins := make([]RunningPlugin, len(c))
+	for i, p := range c {
+		plugins[i] = RunningPlugin{
+			Name:             p.Name(),
+			Version:          p.Version(),
+			Type:             p.TypeName(),
+			HitCount:         p.HitCount(),
+			LastHitTimestamp: p.LastHit().Unix(),
+			ID:               p.ID(),
+			Href:             pluginURI(host, p),
+			PprofPort:        p.Port(),
+		}
 	}
+	return plugins
+}
 
-	if iErr != nil {
-		se := serror.New(errors.New("invalid version"))
-		se.SetFields(f)
-		respond(400, rbody.FromSnapError(se), w)
+func pluginURI(host string, c core.Plugin) string {
+	return fmt.Sprintf("%s://%s/%s/plugins/%s/%s/%d", protocolPrefix, host, version, c.TypeName(), c.Name(), c.Version())
+}
+
+func (s *apiV2) getPlugin(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
+	plType, plName, plVersion, f, se := pluginParameters(p)
+	if se != nil {
+		Write(400, FromSnapError(se), w)
 		return
 	}
 
-	if plName == "" {
-		se := serror.New(errors.New("missing plugin name"))
-		se.SetFields(f)
-		respond(400, rbody.FromSnapError(se), w)
-		return
-	}
-	if plType == "" {
-		se := serror.New(errors.New("missing plugin type"))
-		se.SetFields(f)
-		respond(400, rbody.FromSnapError(se), w)
-		return
-	}
-
-	pluginCatalog := s.mm.PluginCatalog()
+	pluginCatalog := s.metricManager.PluginCatalog()
 	var plugin core.CatalogedPlugin
 	for _, item := range pluginCatalog {
 		if item.Name() == plName &&
@@ -391,18 +387,18 @@ func (s *Server) getPlugin(w http.ResponseWriter, r *http.Request, p httprouter.
 	}
 	if plugin == nil {
 		se := serror.New(ErrPluginNotFound, f)
-		respond(404, rbody.FromSnapError(se), w)
+		Write(404, FromSnapError(se), w)
 		return
 	}
 
 	rd := r.FormValue("download")
 	d, _ := strconv.ParseBool(rd)
-	var configPolicy []rbody.PolicyTable
+	var configPolicy []PolicyTable
 	if plugin.TypeName() == "processor" || plugin.TypeName() == "publisher" {
 		rules := plugin.Policy().Get([]string{""}).RulesAsTable()
-		configPolicy = make([]rbody.PolicyTable, 0, len(rules))
+		configPolicy = make([]PolicyTable, 0, len(rules))
 		for _, r := range rules {
-			configPolicy = append(configPolicy, rbody.PolicyTable{
+			configPolicy = append(configPolicy, PolicyTable{
 				Name:     r.Name,
 				Type:     r.Type,
 				Default:  r.Default,
@@ -412,8 +408,6 @@ func (s *Server) getPlugin(w http.ResponseWriter, r *http.Request, p httprouter.
 			})
 		}
 
-	} else {
-		configPolicy = nil
 	}
 
 	if d {
@@ -421,10 +415,11 @@ func (s *Server) getPlugin(w http.ResponseWriter, r *http.Request, p httprouter.
 		if err != nil {
 			f["plugin-path"] = plugin.PluginPath()
 			se := serror.New(err, f)
-			respond(500, rbody.FromSnapError(se), w)
+			Write(500, FromSnapError(se), w)
 			return
 		}
 
+		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Encoding", "gzip")
 		gz := gzip.NewWriter(w)
 		defer gz.Close()
@@ -432,12 +427,13 @@ func (s *Server) getPlugin(w http.ResponseWriter, r *http.Request, p httprouter.
 		if err != nil {
 			f["plugin-path"] = plugin.PluginPath()
 			se := serror.New(err, f)
-			respond(500, rbody.FromSnapError(se), w)
+			Write(500, FromSnapError(se), w)
 			return
 		}
+		w.WriteHeader(200)
 		return
 	} else {
-		pluginRet := &rbody.PluginReturned{
+		pluginRet := Plugin{
 			Name:            plugin.Name(),
 			Version:         plugin.Version(),
 			Type:            plugin.TypeName(),
@@ -447,10 +443,6 @@ func (s *Server) getPlugin(w http.ResponseWriter, r *http.Request, p httprouter.
 			Href:            pluginURI(r.Host, plugin),
 			ConfigPolicy:    configPolicy,
 		}
-		respond(200, pluginRet, w)
+		Write(200, pluginRet, w)
 	}
-}
-
-func pluginURI(host string, c core.Plugin) string {
-	return fmt.Sprintf("%s://%s/v1/plugins/%s/%s/%d", protocolPrefix, host, c.TypeName(), c.Name(), c.Version())
 }
