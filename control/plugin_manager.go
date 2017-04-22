@@ -519,8 +519,7 @@ func (p *pluginManager) LoadPlugin(details *pluginDetails, emitter gomit.Emitter
 	}
 
 	// Added so clients can adequately clean up connections
-	ap.client.Kill("Retrieved necessary plugin info")
-	err = ePlugin.Kill()
+	err = ap.client.Kill("Retrieved necessary plugin info")
 	if err != nil {
 		pmLogger.WithFields(log.Fields{
 			"_block": "load-plugin",
